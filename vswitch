@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+
+import logging
+import os
+import sys
+import argparse
+import re
+import time
+import csv
+import datetime
+import shutil
+import unittest
+import locale
+import copy
+import glob
+import subprocess
+import ast
+
+from conf import merge_spec
+from conf import settings
+import core.component_factory as component_factory
+from core.loader import Loader
+from tools import functions
+
+VERBOSITY_LEVELS = {
+    'debug': logging.DEBUG,
+    'info': logging.INFO,
+    'warning': logging.WARNING,
+    'error': logging.ERROR,
+    'critical': logging.CRITICAL
+}
+
+_CURR_DIR = os.path.dirname(os.path.realpath(__file__))
+
+_LOGGER = logging.getLogger()
+
+def parse_arguments():
+    """
+    Parse command line arguments.
+    """
+    class _ValidateFileAction(argparse.Action):
+        """Validate a file can be read from before using it.
+        """
+        def __call__(self, parser, namespace, values, option_string=None):
+            if not os.path.isfile(values):
+                raise argparse.ArgumentTypeError(
+                    'the path \'%s\' is not a valid path' % values)
+            elif not os.access(values, os.R_OK):
+                raise argparse.ArgumentTypeError(
+                    'the path \'%s\' is not accessible' % values)
+
+            setattr(namespace, self.dest, values)
+
+    class _ValidateDirAction(argparse.Action):
+        """Validate a directory can be written to before using it.
+        """
+        def __call__(self, parser, namespace, values, option_string=None):
+            if not os.path.isdir(values):
+                raise argparse.ArgumentTypeError(
+                    'the path \'%s\' is not a valid path' % values)
+            elif not os.access(values, os.W_OK):
+                raise argparse.ArgumentTypeError(
+                    'the path \'%s\' is not accessible' % values)
+
+            setattr(namespace, self.dest, values)
+
+    def list_logging_levels():
+        """Give a summary of all available logging levels.
+
+        :return: List of verbosity level names in decreasing order of
+            verbosity
+        """
+        return sorted(VERBOSITY_LEVELS.keys(),
+                      key=lambda x: VERBOSITY_LEVELS[x])
+
+    parser = argparse.ArgumentParser(prog=__file__, formatter_class=
+                                     argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('--version', action='version', version='%(prog)s 0.2')
+    parser.add_argument('--list-vswitches', action='store_true',
+                        help='list all system vswitches and exit')
+    parser.add_argument('--vswitch', help='vswitch implementation to use')
+    parser.add_argument('-m', '--mode', help='mode of operation', default='trafficgen-off')
+    args = vars(parser.parse_args())
+
+    return args
+
+def configure_logging(level):
+    """Configure logging.
+    """
+    name, ext = os.path.splitext(settings.getValue('LOG_FILE_DEFAULT'))
+    rename_default = "{name}_{uid}{ex}".format(name=name,
+                                               uid=settings.getValue(
+                                                   'LOG_TIMESTAMP'),
+                                               ex=ext)
+    log_file_default = os.path.join(
+        settings.getValue('LOG_PATH'), rename_default)
+
+    _LOGGER.setLevel(logging.DEBUG)
+
+    stream_logger = logging.StreamHandler(sys.stdout)
+    stream_logger.setLevel(VERBOSITY_LEVELS[level])
+    stream_logger.setFormatter(logging.Formatter(
+        '[%(levelname)-5s]  %(asctime)s : (%(name)s) - %(message)s'))
+    _LOGGER.addHandler(stream_logger)
+
+    file_logger = logging.FileHandler(filename=log_file_default)
+    file_logger.setLevel(logging.DEBUG)
+    file_logger.setFormatter(logging.Formatter(
+        '%(asctime)s : %(message)s'))
+    _LOGGER.addHandler(file_logger)
+
+class Commands():
+
+    # pylint: disable=too-many-statements
+    def __init__(self):
+        self._vswitch_ctl = None
+        # ensure that path to the bind tool is valid
+        functions.settings_update_paths()
+        self._traffic = copy.deepcopy(settings.getValue('TRAFFIC'))
+        self._tunnel_operation = None
+        self.deployment = settings.getValue('DEPLOYMENT')
+        loader = Loader()
+        #settings.setValue('VSWITCH', cfg.get('vSwitch', settings.getValue('VSWITCH')))
+        self._vswitch_ctl = component_factory.create_vswitch(
+            self.deployment,
+            loader.get_vswitch_class(),
+            self._traffic,
+            self._tunnel_operation)
+
+    def setup(self):
+        self._vswitch_ctl.setup()
+
+
+    def add_flows(self):
+        """Add flows to the vswitch
+        """
+        vswitch = self._vswitch_ctl.get_vswitch()
+        # NOTE BOM 15-08-07 the frame mod code assumes that the
+        # physical ports are ports 1 & 2. The actual numbers
+        # need to be retrived from the vSwitch and the metadata value
+        # updated accordingly.
+        bridge = settings.getValue('VSWITCH_BRIDGE_NAME')
+        if self._frame_mod == "vlan":
+            # 0x8100 => VLAN ethertype
+            self._logger.debug(" ****   VLAN   ***** ")
+            flow = {'table':'2', 'priority':'1000', 'metadata':'2',
+                    'actions': ['push_vlan:0x8100', 'goto_table:3']}
+            vswitch.add_flow(bridge, flow)
+            flow = {'table':'2', 'priority':'1000', 'metadata':'1',
+                    'actions': ['push_vlan:0x8100', 'goto_table:3']}
+            vswitch.add_flow(bridge, flow)
+        elif self._frame_mod == "mpls":
+            # 0x8847 => MPLS unicast ethertype
+            self._logger.debug(" ****   MPLS  ***** ")
+            flow = {'table':'2', 'priority':'1000', 'metadata':'2',
+                    'actions': ['push_mpls:0x8847', 'goto_table:3']}
+            vswitch.add_flow(bridge, flow)
+            flow = {'table':'2', 'priority':'1000', 'metadata':'1',
+                    'actions': ['push_mpls:0x8847', 'goto_table:3']}
+            vswitch.add_flow(bridge, flow)
+        elif self._frame_mod == "mac":
+            flow = {'table':'2', 'priority':'1000', 'metadata':'2',
+                    'actions': ['mod_dl_src:22:22:22:22:22:22',
+                                'goto_table:3']}
+            vswitch.add_flow(bridge, flow)
+            flow = {'table':'2', 'priority':'1000', 'metadata':'1',
+                    'actions': ['mod_dl_src:11:11:11:11:11:11',
+                                'goto_table:3']}
+            vswitch.add_flow(bridge, flow)
+        elif self._frame_mod == "dscp":
+            # DSCP 184d == 0x4E<<2 => 'Expedited Forwarding'
+            flow = {'table':'2', 'priority':'1000', 'metadata':'2',
+                    'dl_type':'0x0800',
+                    'actions': ['mod_nw_tos:184', 'goto_table:3']}
+            vswitch.add_flow(bridge, flow)
+            flow = {'table':'2', 'priority':'1000', 'metadata':'1',
+                    'dl_type':'0x0800',
+                    'actions': ['mod_nw_tos:184', 'goto_table:3']}
+            vswitch.add_flow(bridge, flow)
+        elif self._frame_mod == "ttl":
+            # 251 and 241 are the highest prime numbers < 255
+            flow = {'table':'2', 'priority':'1000', 'metadata':'2',
+                    'dl_type':'0x0800',
+                    'actions': ['mod_nw_ttl:251', 'goto_table:3']}
+            vswitch.add_flow(bridge, flow)
+            flow = {'table':'2', 'priority':'1000', 'metadata':'1',
+                    'dl_type':'0x0800',
+                    'actions': ['mod_nw_ttl:241', 'goto_table:3']}
+            vswitch.add_flow(bridge, flow)
+        elif self._frame_mod == "ip_addr":
+            flow = {'table':'2', 'priority':'1000', 'metadata':'2',
+                    'dl_type':'0x0800',
+                    'actions': ['mod_nw_src:10.10.10.10',
+                                'mod_nw_dst:20.20.20.20',
+                                'goto_table:3']}
+            vswitch.add_flow(bridge, flow)
+            flow = {'table':'2', 'priority':'1000', 'metadata':'1',
+                    'dl_type':'0x0800',
+                    'actions': ['mod_nw_src:20.20.20.20',
+                                'mod_nw_dst:10.10.10.10',
+                                'goto_table:3']}
+            vswitch.add_flow(bridge, flow)
+        elif self._frame_mod == "ip_port":
+            # NOTE BOM 15-08-27 The traffic generated is assumed
+            # to be UDP (nw_proto 17d) which is the default case but
+            # we will need to pick up the actual traffic params in use.
+            flow = {'table':'2', 'priority':'1000', 'metadata':'2',
+                    'dl_type':'0x0800', 'nw_proto':'17',
+                    'actions': ['mod_tp_src:44444',
+                                'mod_tp_dst:44444', 'goto_table:3']}
+            vswitch.add_flow(bridge, flow)
+            flow = {'table':'2', 'priority':'1000', 'metadata':'1',
+                    'dl_type':'0x0800', 'nw_proto':'17',
+                    'actions': ['mod_tp_src:44444',
+                                'mod_tp_dst:44444', 'goto_table:3']}
+            vswitch.add_flow(bridge, flow)
+        else:
+            pass
+
+def get_vswitch_names(rst_files):
+    """ Function will return a list of vSwitches detected in given ``rst_files``.
+    """
+    vswitch_names = set()
+    if rst_files:
+        try:
+            output = subprocess.check_output(['grep', '-h', '^* vSwitch'] + rst_files).decode().splitlines()
+            for line in output:
+                match = re.search(r'^\* vSwitch: ([^,]+)', str(line))
+                if match:
+                    vswitch_names.add(match.group(1))
+
+            if vswitch_names:
+                return list(vswitch_names)
+
+        except subprocess.CalledProcessError:
+            _LOGGER.warning('Cannot detect vSwitches used during testing.')
+
+    # fallback to the default value
+    return ['vSwitch']
+
+def handle_list_options(args):
+    """ Process --list cli arguments if needed
+
+    :param args: A dictionary with all CLI arguments
+    """
+    if args['list_vswitches']:
+        print(Loader().get_vswitches_printable())
+        sys.exit(0)
+
+
+def main():
+    """Main function.
+    """
+    args = parse_arguments()
+
+    # configure settings
+
+    settings.load_from_dir(os.path.join(_CURR_DIR, 'conf'))
+
+    # define the timestamp to be used by logs and results
+    date = datetime.datetime.fromtimestamp(time.time())
+    timestamp = date.strftime('%Y-%m-%d_%H-%M-%S')
+    settings.setValue('LOG_TIMESTAMP', timestamp)
+    # load command line parameters first in case there are settings files
+    # to be used
+    settings.load_from_dict(args)
+
+    settings.setValue('mode', args['mode'])
+
+    # reload command line parameters since these should take higher priority
+    # than both a settings file and environment variables
+    settings.load_from_dict(args)
+
+    # if required, handle list-* operations
+    handle_list_options(args)
+
+    configure_logging(settings.getValue('VERBOSITY'))
+
+    # configuration validity checks
+    if args['vswitch']:
+        vswitch_none = args['vswitch'].strip().lower() == 'none'
+        if vswitch_none:
+            settings.setValue('VSWITCH', 'none')
+        else:
+            vswitches = Loader().get_vswitches()
+            if args['vswitch'] not in vswitches:
+                _LOGGER.error('There are no vswitches matching \'%s\' found in'
+                              ' \'%s\'. Exiting...', args['vswitch'],
+                              settings.getValue('VSWITCH_DIR'))
+            else:
+                print("All Good")
+    else:
+        print("What?")
+    cmd = Commands()
+
+
+if __name__ == "__main__":
+    main()
