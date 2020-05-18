@@ -58,6 +58,12 @@ class VswitchControllerP2P(IVswitchController):
         self._logger.debug('Stop using %s', str(self._vswitch_class))
         self._vswitch.stop()
 
+    def get_bridge_info(self):
+        """
+        Get Bridge info.
+        """
+        return self._bridge
+
     def get_ports_info(self):
         """See IVswitchController for description
         """

@@ -95,6 +95,7 @@ def settings_update_paths():
                     tools['{}_src'.format(path_class)] = tmp_tool
                     continue
                 else:
+                    # print("DOES NOT EXIST")
                     raise RuntimeError('Path {} does not exist.'.format(tmp_tool))
 
             # store list of modules of given class into tools dict
@@ -105,6 +106,7 @@ def settings_update_paths():
                     if module.endswith('.ko') and not os.path.isabs(module):
                         module = os.path.join(paths[path_class]['path'], module)
                         if not os.path.exists(module):
+                            #print("DOES NOT EXIST")
                             raise RuntimeError('Cannot locate modlue {}'.format(module))
 
                     tmp_modules.append(module)
@@ -121,14 +123,17 @@ def settings_update_paths():
                 elif shutil.which(tmp_tool):
                     tmp_tool = shutil.which(tmp_tool)
                 else:
+                    # print("DOES NOT EXIST")
                     raise RuntimeError('Cannot locate tool {}'.format(tmp_tool))
 
             # expand OS wildcards in paths if needed
             if glob.has_magic(tmp_tool):
                 tmp_glob = glob.glob(tmp_tool)
                 if not tmp_glob:
+                    # print("DOES NOT EXIST")
                     raise RuntimeError('Path to the {} is not valid: {}.'.format(tool, tmp_tool))
                 elif len(tmp_glob) > 1:
+                    # print("DOES NOT EXIST")
                     raise RuntimeError('Path to the {} is ambiguous {}'.format(tool, tmp_glob))
                 elif len(tmp_glob) == 1:
                     tmp_tool = tmp_glob[0]
@@ -137,6 +142,7 @@ def settings_update_paths():
                     logging.getLogger().debug('Temporary path to the %s does not '
                                               'exist: %s', tool, tmp_tool)
                 else:
+                    # print("DOES NOT EXIST")
                     raise RuntimeError('Path to the {} is not valid: {}'.format(tool, tmp_tool))
 
             tools[tool] = tmp_tool

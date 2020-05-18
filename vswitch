@@ -21,6 +21,7 @@ from conf import settings
 import core.component_factory as component_factory
 from core.loader import Loader
 from tools import functions
+from tools import networkcard
 
 VERBOSITY_LEVELS = {
     'debug': logging.DEBUG,
@@ -80,6 +81,8 @@ def parse_arguments():
                         help='list all system vswitches and exit')
     parser.add_argument('--vswitch', help='vswitch implementation to use')
     parser.add_argument('-m', '--mode', help='mode of operation', default='trafficgen-off')
+    parser.add_argument('--conf-file', action=_ValidateFileAction,
+                       help='settings file')
     args = vars(parser.parse_args())
 
     return args
@@ -109,26 +112,26 @@ def configure_logging(level):
         '%(asctime)s : %(message)s'))
     _LOGGER.addHandler(file_logger)
 
-class Commands():
+class VswitchMgr():
 
     # pylint: disable=too-many-statements
     def __init__(self):
         self._vswitch_ctl = None
         # ensure that path to the bind tool is valid
         functions.settings_update_paths()
-        self._traffic = copy.deepcopy(settings.getValue('TRAFFIC'))
-        self._tunnel_operation = None
+        self.traffic = copy.deepcopy(settings.getValue('TRAFFIC'))
+        self.tunnel_operation = None
         self.deployment = settings.getValue('DEPLOYMENT')
         loader = Loader()
         #settings.setValue('VSWITCH', cfg.get('vSwitch', settings.getValue('VSWITCH')))
-        self._vswitch_ctl = component_factory.create_vswitch(
+        self.vswitch_ctl = component_factory.create_vswitch(
             self.deployment,
             loader.get_vswitch_class(),
-            self._traffic,
-            self._tunnel_operation)
+            self.traffic,
+            self.tunnel_operation)
 
     def setup(self):
-        self._vswitch_ctl.setup()
+        self.vswitch_ctl.setup()
 
 
     def add_flows(self):
@@ -247,6 +250,52 @@ def handle_list_options(args):
         print(Loader().get_vswitches_printable())
         sys.exit(0)
 
+def enable_sriov(nic_list):
+    """ Enable SRIOV for given enhanced PCI IDs
+
+    :param nic_list: A list of enhanced PCI IDs
+    """
+    # detect if sriov is required
+    sriov_nic = {}
+    for nic in nic_list:
+        if networkcard.is_sriov_nic(nic):
+            tmp_nic = nic.split('|')
+            if tmp_nic[0] in sriov_nic:
+                if int(tmp_nic[1][2:]) > sriov_nic[tmp_nic[0]]:
+                    sriov_nic[tmp_nic[0]] = int(tmp_nic[1][2:])
+            else:
+                sriov_nic.update({tmp_nic[0] : int(tmp_nic[1][2:])})
+
+    # sriov is required for some NICs
+    if sriov_nic:
+        for nic in sriov_nic:
+            # check if SRIOV is supported and enough virt interfaces are available
+            if not networkcard.is_sriov_supported(nic) \
+                or networkcard.get_sriov_numvfs(nic) <= sriov_nic[nic]:
+                # if not, enable and set appropriate number of VFs
+                if not networkcard.set_sriov_numvfs(nic, sriov_nic[nic] + 1):
+                    raise RuntimeError('SRIOV cannot be enabled for NIC {}'.format(nic))
+                else:
+                    _LOGGER.debug("SRIOV enabled for NIC %s", nic)
+
+                # ensure that path to the bind tool is valid
+                functions.settings_update_paths()
+
+                # WORKAROUND: it has been observed with IXGBE(VF) driver,
+                # that NIC doesn't correclty dispatch traffic to VFs based
+                # on their MAC address. Unbind and bind to the same driver
+                # solves this issue.
+                networkcard.reinit_vfs(nic)
+
+        # After SRIOV is enabled it takes some time until network drivers
+        # properly initialize all cards.
+        # Wait also in case, that SRIOV was already configured as it can be
+        # configured automatically just before vsperf execution.
+        time.sleep(2)
+
+        return True
+
+    return False
 
 def main():
     """Main function.
@@ -265,6 +314,10 @@ def main():
     # to be used
     settings.load_from_dict(args)
 
+    if args['conf_file']:
+        settings.load_from_file(args['conf_file'])
+
+
     settings.setValue('mode', args['mode'])
 
     # reload command line parameters since these should take higher priority
@@ -275,6 +328,31 @@ def main():
     handle_list_options(args)
 
     configure_logging(settings.getValue('VERBOSITY'))
+
+        # modify NIC configuration to decode enhanced PCI IDs
+    wl_nics_orig = list(networkcard.check_pci(pci) for pci in settings.getValue('WHITELIST_NICS'))
+    settings.setValue('WHITELIST_NICS_ORIG', wl_nics_orig)
+
+    # sriov handling is performed on checked/expanded PCI IDs
+    settings.setValue('SRIOV_ENABLED', enable_sriov(wl_nics_orig))
+
+    nic_list = []
+    for nic in wl_nics_orig:
+        tmp_nic = networkcard.get_nic_info(nic)
+        if tmp_nic:
+            nic_list.append({'pci' : tmp_nic,
+                             'type' : 'vf' if networkcard.get_sriov_pf(tmp_nic) else 'pf',
+                             'mac' : networkcard.get_mac(tmp_nic),
+                             'driver' : networkcard.get_driver(tmp_nic),
+                             'device' : networkcard.get_device_name(tmp_nic)})
+        else:
+            vsperf_finalize()
+            raise RuntimeError("Invalid network card PCI ID: '{}'".format(nic))
+
+    settings.setValue('NICS', nic_list)
+    # for backward compatibility
+    settings.setValue('WHITELIST_NICS', list(nic['pci'] for nic in nic_list))
+
 
     # configuration validity checks
     if args['vswitch']:
@@ -291,7 +369,9 @@ def main():
                 print("All Good")
     else:
         print("What?")
-    cmd = Commands()
+    vmgr = VswitchMgr()
+    print(vmgr.vswitch_ctl.get_vswitch())
+    print(vmgr.vswitch_ctl.get_bridge_info())
 
 
 if __name__ == "__main__":
